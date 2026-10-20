@@ -83,34 +83,44 @@ def _bounding_box(workdir: str, pdf_name: str, dpi: int):
     width = (ruc[0] - llc[0]) * size_factor
     height = (ruc[1] - llc[1]) * size_factor
 
-    # Aspect-ratio correction (ported from InLaTeXbot LatexConverter)
+    # Fix for Blank PNG: Bypass aspect-ratio correction for full documents.
+    # 500 points is roughly 7 inches. If the content is taller than this, 
+    # it's a full document, not a small equation snippet.
+    is_full_page = (ruc[1] - llc[1]) > 500
+
     translation_x, translation_y = llc[0], llc[1]
-    if width > 3 * height:
-        translation_y += (width / 3 - height) / 2 / size_factor
-        height = width / 3
-    elif height > 1 * width:
-        translation_x += (height - width) / 2 / size_factor
-        width = height
+    
+    if not is_full_page:
+        # Aspect-ratio correction (ported from InLaTeXbot LatexConverter)
+        if width > 3 * height:
+            translation_y += (width / 3 - height) / 2 / size_factor
+            height = width / 3
+        elif height > 1 * width:
+            translation_x += (height - width) / 2 / size_factor
+            width = height
 
-    return int(round(width)), int(round(height)), int(round(translation_x)), int(round(translation_y))
+    # Fix for Blank PDF: CropBox expects [llx, lly, urx, ury] in PostScript points.
+    # The previous code was incorrectly passing [width, height, tx, ty].
+    crop_box = [int(round(llc[0])), int(round(llc[1])), int(round(ruc[0])), int(round(ruc[1]))]
+
+    return int(round(width)), int(round(height)), crop_box, int(round(translation_x)), int(round(translation_y))
 
 
-def _crop_pdf(workdir: str, session: str, bounds) -> str:
+def _crop_pdf(workdir: str, session: str, crop_box) -> str:
     cropped = f"expression_file_cropped_{session}.pdf"
     cmd = (
         "gs -o build/" + cropped + " -sDEVICE=pdfwrite "
-        f'-c "[/CropBox [{bounds[0]} {bounds[1]} {bounds[2]} {bounds[3]}]" '
+        f'-c "[/CropBox [{crop_box[0]} {crop_box[1]} {crop_box[2]} {crop_box[3]}]" '
         '-c " /PAGES pdfmark" -f build/' + f"expression_file_{session}.pdf"
     )
     _run(["/bin/sh", "-c", cmd], workdir, GS_TIMEOUT)
     return cropped
 
 
-def _render_png(workdir: str, session: str, dpi: int, bbox) -> str:
+def _render_png(workdir: str, session: str, dpi: int, width: int, height: int, tx: int, ty: int) -> str:
     png = f"expression_{session}.png"
-    w, h, tx, ty = bbox
     cmd = (
-        "gs -o build/" + png + f" -r{dpi} -sDEVICE=pngalpha -g{w}x{h} -dLastPage=1 "
+        "gs -o build/" + png + f" -r{dpi} -sDEVICE=pngalpha -g{width}x{height} -dLastPage=1 "
         f'-c "<</Install {{{tx} {ty} translate}}>> setpagedevice" -f build/'
         + f"expression_file_{session}.pdf"
     )
@@ -131,18 +141,25 @@ async def compile(req: CompileRequest, x_compile_token: str = Header(default="")
         (src / f"expression_file_{session}.tex").write_text(req.document, encoding="utf-8")
         try:
             await run_in_threadpool(_tectonic, tmp, f"expression_file_{session}.tex")
-            bbox = await run_in_threadpool(_bounding_box, tmp, f"expression_file_{session}.pdf", req.dpi)
-            png = await run_in_threadpool(_render_png, tmp, session, req.dpi, bbox)
+            
+            # Unpack the 5 returned values from _bounding_box
+            width_px, height_px, crop_box, tx, ty = await run_in_threadpool(
+                _bounding_box, tmp, f"expression_file_{session}.pdf", req.dpi
+            )
+            
+            png = await run_in_threadpool(_render_png, tmp, session, req.dpi, width_px, height_px, tx, ty)
             png_b64 = base64.b64encode((Path(tmp, "build") / png).read_bytes()).decode()
+            
             pdf_b64 = None
             if req.return_pdf:
-                cropped = await run_in_threadpool(_crop_pdf, tmp, session, bbox)
+                cropped = await run_in_threadpool(_crop_pdf, tmp, session, crop_box)
                 pdf_b64 = base64.b64encode((Path(tmp, "build") / cropped).read_bytes()).decode()
+                
             return {
                 "png": png_b64,
                 "pdf": pdf_b64,
-                "width_px": bbox[0],
-                "height_px": bbox[1],
+                "width_px": width_px,
+                "height_px": height_px,
             }
         except subprocess.TimeoutExpired:
             raise HTTPException(status_code=400, detail="Compilation timed out.")

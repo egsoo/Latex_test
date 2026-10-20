@@ -1,10 +1,4 @@
-"""LaTeX compile microservice for the InLaTeXbot Lovable port.
-
-POST /compile  {document: str, dpi: int, return_pdf: bool}
-  -> 200 {"png": "<base64>", "pdf": "<base64 or null>", "width_px": int, "height_px": int}
-  -> 400 {"detail": "<LaTeX error message>"}
-GET  /health -> {"status": "ok"}   (pinger target)
-"""
+"""LaTeX compile microservice for the InLaTeXbot Lovable port."""
 import base64
 import os
 import subprocess
@@ -20,7 +14,6 @@ from warmup import start_warmup_thread
 
 app = FastAPI()
 
-
 @app.on_event('startup')
 def on_startup():
     start_warmup_thread()
@@ -28,19 +21,15 @@ def on_startup():
 TECTONIC_TIMEOUT = 90
 GS_TIMEOUT = 60
 
-
 class CompileRequest(BaseModel):
     document: str = Field(min_length=1, max_length=50000)
     dpi: int = Field(default=300, ge=100, le=1000)
     return_pdf: bool = False
 
-
 def _run(cmd: list, cwd: str, timeout: int) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
 
-
 def _latex_error(output: str) -> str | None:
-    """Extract the first '! ...' LaTeX error block from compiler output."""
     lines = output.splitlines()
     for idx, line in enumerate(lines):
         if line.startswith("! "):
@@ -51,14 +40,12 @@ def _latex_error(output: str) -> str | None:
             return line[:500]
     return None
 
-
 def _tectonic(workdir: str, tex_name: str) -> None:
     proc = _run(["tectonic", "-o", "build", f"src/{tex_name}"], workdir, TECTONIC_TIMEOUT)
     pdf = Path(workdir) / "build" / tex_name.replace(".tex", ".pdf")
     if not pdf.exists():
         msg = _latex_error((proc.stdout or "") + (proc.stderr or "")) or "LaTeX compilation failed (no output produced)."
         raise ValueError(msg)
-
 
 def _bounding_box(workdir: str, pdf_name: str, dpi: int):
     proc = _run(
@@ -76,37 +63,43 @@ def _bounding_box(workdir: str, pdf_name: str, dpi: int):
         raise ValueError("Empty expression!")
 
     hpad, vpad = 0.25 * 72, 0.1 * 72  # 72 postscript points = 1 inch
-    llc = [bounds[0] - hpad, bounds[1] - vpad]
-    ruc = [bounds[2] + hpad, bounds[3] + vpad]
+    llx = bounds[0] - hpad
+    lly = bounds[1] - vpad
+    urx = bounds[2] + hpad
+    ury = bounds[3] + vpad
+
+    width_pt = urx - llx
+    height_pt = ury - lly
+
+    # Check if it's a full document page (e.g., A4 is ~595x842 points).
+    # If the content is larger than 500 points, bypass the aggressive snippet cropping.
+    is_full_page = height_pt > 500 or width_pt > 500
+
+    if not is_full_page:
+        # Aspect-ratio correction (Ported from InLaTeXbot for small equations)
+        # We safely adjust the bounding box coordinates directly instead of messing with pixel translations.
+        if width_pt > 3 * height_pt:
+            new_height = width_pt / 3
+            diff = new_height - height_pt
+            lly -= diff / 2
+            ury += diff / 2
+        elif height_pt > width_pt:
+            new_width = height_pt
+            diff = new_width - width_pt
+            llx -= diff / 2
+            urx += diff / 2
 
     size_factor = dpi / 72
-    width = (ruc[0] - llc[0]) * size_factor
-    height = (ruc[1] - llc[1]) * size_factor
-
-    # Fix for Blank PNG: Bypass aspect-ratio correction for full documents.
-    # 500 points is roughly 7 inches. If the content is taller than this, 
-    # it's a full document, not a small equation snippet.
-    is_full_page = (ruc[1] - llc[1]) > 500
-
-    translation_x, translation_y = llc[0], llc[1]
+    width_px = int(round((urx - llx) * size_factor))
+    height_px = int(round((ury - lly) * size_factor))
     
-    if not is_full_page:
-        # Aspect-ratio correction (ported from InLaTeXbot LatexConverter)
-        if width > 3 * height:
-            translation_y += (width / 3 - height) / 2 / size_factor
-            height = width / 3
-        elif height > 1 * width:
-            translation_x += (height - width) / 2 / size_factor
-            width = height
+    # CropBox expects [lower_left_x, lower_left_y, upper_right_x, upper_right_y]
+    crop_box = [int(round(llx)), int(round(lly)), int(round(urx)), int(round(ury))]
 
-    # Fix for Blank PDF: CropBox expects [llx, lly, urx, ury] in PostScript points.
-    # The previous code was incorrectly passing [width, height, tx, ty].
-    crop_box = [int(round(llc[0])), int(round(llc[1])), int(round(ruc[0])), int(round(ruc[1]))]
-
-    return int(round(width)), int(round(height)), crop_box, int(round(translation_x)), int(round(translation_y))
-
+    return width_px, height_px, crop_box
 
 def _crop_pdf(workdir: str, session: str, crop_box) -> str:
+    """Creates a PDF with a specific CropBox applied to it."""
     cropped = f"expression_file_cropped_{session}.pdf"
     cmd = (
         "gs -o build/" + cropped + " -sDEVICE=pdfwrite "
@@ -116,44 +109,51 @@ def _crop_pdf(workdir: str, session: str, crop_box) -> str:
     _run(["/bin/sh", "-c", cmd], workdir, GS_TIMEOUT)
     return cropped
 
-
-def _render_png(workdir: str, session: str, dpi: int, width: int, height: int, tx: int, ty: int) -> str:
+def _render_png(workdir: str, session: str, dpi: int, cropped_pdf_name: str) -> str:
+    """Renders the cropped PDF directly to PNG using Ghostscript's built-in CropBox logic."""
     png = f"expression_{session}.png"
+    
+    # -dUseCropBox tells Ghostscript to strictly respect the CropBox we set in the PDF.
+    # This eliminates all the manual -g (canvas) and translate math which caused the clipping.
     cmd = (
-        "gs -o build/" + png + f" -r{dpi} -sDEVICE=pngalpha -g{width}x{height} -dLastPage=1 "
-        f'-c "<</Install {{{tx} {ty} translate}}>> setpagedevice" -f build/'
-        + f"expression_file_{session}.pdf"
+        "gs -o build/" + png + f" -r{dpi} -sDEVICE=pngalpha -dUseCropBox -dLastPage=1 -f build/" + cropped_pdf_name
     )
     _run(["/bin/sh", "-c", cmd], workdir, GS_TIMEOUT)
     return png
-
 
 @app.post("/compile")
 async def compile(req: CompileRequest, x_compile_token: str = Header(default="")):
     expected = os.environ.get("COMPILE_TOKEN", "")
     if expected and x_compile_token != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
+        
     session = uuid.uuid4().hex[:12]
     with tempfile.TemporaryDirectory(prefix=f"latex_{session}_") as tmp:
         Path(tmp, "build").mkdir()
         src = Path(tmp, "src")
         src.mkdir()
         (src / f"expression_file_{session}.tex").write_text(req.document, encoding="utf-8")
+        
         try:
+            # 1. Compile LaTeX to PDF
             await run_in_threadpool(_tectonic, tmp, f"expression_file_{session}.tex")
             
-            # Unpack the 5 returned values from _bounding_box
-            width_px, height_px, crop_box, tx, ty = await run_in_threadpool(
+            # 2. Calculate Bounding Box and Crop coordinates
+            width_px, height_px, crop_box = await run_in_threadpool(
                 _bounding_box, tmp, f"expression_file_{session}.pdf", req.dpi
             )
             
-            png = await run_in_threadpool(_render_png, tmp, session, req.dpi, width_px, height_px, tx, ty)
+            # 3. Physically crop the PDF (we do this regardless of return_pdf because the PNG needs it)
+            cropped_pdf = await run_in_threadpool(_crop_pdf, tmp, session, crop_box)
+            
+            # 4. Render the cropped PDF to PNG
+            png = await run_in_threadpool(_render_png, tmp, session, req.dpi, cropped_pdf)
             png_b64 = base64.b64encode((Path(tmp, "build") / png).read_bytes()).decode()
             
+            # 5. Return PDF if requested
             pdf_b64 = None
             if req.return_pdf:
-                cropped = await run_in_threadpool(_crop_pdf, tmp, session, crop_box)
-                pdf_b64 = base64.b64encode((Path(tmp, "build") / cropped).read_bytes()).decode()
+                pdf_b64 = base64.b64encode((Path(tmp, "build") / cropped_pdf).read_bytes()).decode()
                 
             return {
                 "png": png_b64,
@@ -167,7 +167,6 @@ async def compile(req: CompileRequest, x_compile_token: str = Header(default="")
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:  # noqa: BLE001
             raise HTTPException(status_code=500, detail=f"Compile service error: {e}")
-
 
 @app.get("/health")
 async def health():
